@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from .api.routes.podcast import router as podcast_router
 
@@ -16,18 +17,27 @@ def create_app() -> FastAPI:
         description="Backend for the PulseCast AI-generated podcast workflow.",
     )
 
-    # Routers
-    # NOTE: Route handlers are currently skeletons and will be implemented
-    # in the `api-integration` task.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
     app.include_router(
         podcast_router,
         prefix="/api/v1/podcast",
         tags=["podcast"],
     )
 
+    @app.get("/health")
+    async def health_check() -> dict:
+        """Health check endpoint."""
+        return {"status": "healthy", "service": "pulsecast-api"}
+
     return app
 
 
-# ASGI entrypoint used by uvicorn / gunicorn.
 app = create_app()
 

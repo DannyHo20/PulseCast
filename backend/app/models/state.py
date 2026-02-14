@@ -1,77 +1,154 @@
 """
 Canonical podcast state models for PulseCast.
 
-For now this file provides a minimal placeholder `PodcastState` model and
-helper functions so that other parts of the backend can depend on a stable
-interface. The full schema should be aligned with `PULSECAST_SPEC.md` in a
-follow-up task.
+This module defines the PodcastState model that flows through the LangGraph
+orchestration layer and is persisted via the repository.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from datetime import datetime
+from enum import Enum
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
 
+class JobStatus(str, Enum):
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+
+class CurrentStep(str, Enum):
+    INGESTING = "INGESTING"
+    RESEARCHING = "RESEARCHING"
+    SCRIPTING = "SCRIPTING"
+    DIRECTOR = "DIRECTOR"
+    AUDIO = "AUDIO"
+    COMPLETED = "COMPLETED"
+
+
+class DirectorDecision(str, Enum):
+    APPROVE = "APPROVE"
+    REWRITE = "REWRITE"
+
+
+class AudioSegment(BaseModel):
+    speaker: str = Field(..., description="Speaker name (LEO or SARAH)")
+    text: str = Field(..., description="Text segment for TTS")
+    audio_url: Optional[str] = Field(default=None, description="URL to generated audio")
+
+
 class PodcastState(BaseModel):
-    """
-    Minimal placeholder for the podcast generation state.
-
-    TODO:
-    - Mirror the full schema defined in `PULSECAST_SPEC.md`.
-    - Document field semantics and which agents may read/write them.
-    """
-
     id: str = Field(..., description="Unique identifier for this podcast job.")
     source_url: str = Field(..., description="Original content source URL.")
-    current_step: Optional[str] = Field(
-        default=None,
-        description="High-level step in the workflow (e.g. ingestion, script, audio).",
-    )
-    script: Optional[str] = Field(
-        default=None,
-        description="Current podcast script text. Final form will likely be structured.",
-    )
-    critique_count: int = Field(
-        default=0,
-        description="Number of times the Director has requested a REWRITE.",
+    source_title: Optional[str] = Field(default=None, description="Title extracted from source.")
+    created_at: datetime = Field(default_factory=datetime.utcnow, description="Job creation timestamp.")
+    updated_at: datetime = Field(default_factory=datetime.utcnow, description="Last update timestamp.")
+
+    source_markdown: Optional[str] = Field(default=None, description="Extracted markdown from source.")
+    knowledge_points: Optional[str] = Field(default=None, description="Beat-sheet extracted by researcher.")
+    script: Optional[str] = Field(default=None, description="Current podcast script with LEO:/SARAH: lines.")
+    script_version: int = Field(default=0, description="Script revision counter.")
+
+    status: JobStatus = Field(default=JobStatus.PENDING, description="Overall job status.")
+    current_step: CurrentStep = Field(default=CurrentStep.INGESTING, description="Current processing step.")
+    progress_pct: int = Field(default=0, ge=0, le=100, description="Progress percentage 0-100.")
+
+    critique_count: int = Field(default=0, description="Number of REWRITE cycles.")
+    critique_limit: int = Field(default=3, description="Maximum allowed REWRITE cycles.")
+
+    audio_segments: Optional[List[AudioSegment]] = Field(default=None, description="Generated audio segments.")
+    final_podcast_url: Optional[str] = Field(default=None, description="URL to final podcast audio file.")
+    duration_seconds: Optional[float] = Field(default=None, description="Final podcast duration.")
+
+    error_message: Optional[str] = Field(default=None, description="Error message if FAILED.")
+
+    director_decision: Optional[DirectorDecision] = Field(default=None, description="Director's decision after review.")
+
+
+class PodcastStateUpdate(BaseModel):
+    source_title: Optional[str] = None
+    source_markdown: Optional[str] = None
+    knowledge_points: Optional[str] = None
+    script: Optional[str] = None
+    script_version: Optional[int] = None
+    status: Optional[JobStatus] = None
+    current_step: Optional[CurrentStep] = None
+    progress_pct: Optional[int] = None
+    critique_count: Optional[int] = None
+    audio_segments: Optional[List[AudioSegment]] = None
+    final_podcast_url: Optional[str] = None
+    duration_seconds: Optional[float] = None
+    error_message: Optional[str] = None
+    director_decision: Optional[DirectorDecision] = None
+
+
+class GenerateRequest(BaseModel):
+    source_url: str = Field(..., description="URL of the content to convert to podcast.")
+
+
+class GenerateResponse(BaseModel):
+    job_id: str
+    status: JobStatus
+    current_step: CurrentStep
+
+
+class StatusResponse(BaseModel):
+    job_id: str
+    status: JobStatus
+    current_step: CurrentStep
+    progress_pct: int
+    script_version: int
+    source_title: Optional[str]
+    final_podcast_url: Optional[str]
+    error_message: Optional[str]
+
+
+class DownloadResponse(BaseModel):
+    final_podcast_url: str
+    duration_seconds: Optional[float]
+
+
+class EditRequest(BaseModel):
+    job_id: str = Field(..., description="Job ID to edit.")
+    script: str = Field(..., description="New script content.")
+    resume_from_director: bool = Field(default=False, description="Resume workflow from director.")
+
+
+class EditResponse(BaseModel):
+    job_id: str
+    script_version: int
+    status: JobStatus
+
+
+def new_state(job_id: str, source_url: str) -> PodcastState:
+    """Create a new PodcastState with default values."""
+    return PodcastState(
+        id=job_id,
+        source_url=source_url,
+        status=JobStatus.PENDING,
+        current_step=CurrentStep.INGESTING,
+        progress_pct=0,
     )
 
 
-def new_state_from_source_url(source_url: str, job_id: str) -> PodcastState:
-    """
-    Initialize a new `PodcastState` from a source URL.
-
-    The full initialization logic will be fleshed out in later tasks.
-    """
-    return PodcastState(id=job_id, source_url=source_url, current_step="ingestion")
+def apply_update(state: PodcastState, update: PodcastStateUpdate) -> PodcastState:
+    """Apply partial updates to a PodcastState."""
+    update_data = update.model_dump(exclude_unset=True)
+    current_data = state.model_dump()
+    current_data.update(update_data)
+    current_data["updated_at"] = datetime.utcnow()
+    return PodcastState.model_validate(current_data)
 
 
 def serialize_state(state: PodcastState) -> Dict[str, Any]:
-    """
-    Serialize the state for storage in a DB/cache layer.
-
-    Storage-specific concerns (e.g. JSON vs. JSONB) are handled elsewhere.
-    """
+    """Serialize state for storage."""
     return state.model_dump()
 
 
 def deserialize_state(payload: Dict[str, Any]) -> PodcastState:
-    """Reconstruct a `PodcastState` instance from a stored payload."""
+    """Deserialize state from storage."""
     return PodcastState.model_validate(payload)
-
-
-def increment_critique_count(state: PodcastState, *, max_critique_count: int) -> PodcastState:
-    """
-    Safely increment the critique counter, enforcing an upper bound.
-
-    In the full implementation this will be used by the Director node to
-    guard against infinite REWRITE loops.
-    """
-    if state.critique_count >= max_critique_count:
-        return state
-
-    state.critique_count += 1
-    return state
-

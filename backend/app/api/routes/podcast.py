@@ -1,51 +1,264 @@
-from fastapi import APIRouter, HTTPException, Path
+"""
+Podcast API routes for PulseCast.
 
+Endpoints:
+- POST /generate: Start a new podcast generation job
+- GET /status/{job_id}: Get current status of a job
+- GET /download/{job_id}: Download the final podcast
+- PATCH /edit: Edit the script and optionally resume
+"""
+
+from __future__ import annotations
+
+import asyncio
+import uuid
+from datetime import datetime
+
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Path
+
+from ...graph.graph import get_graph_runner
+from ...models.state import (
+    CurrentStep,
+    DownloadResponse,
+    EditRequest,
+    EditResponse,
+    GenerateRequest,
+    GenerateResponse,
+    JobStatus,
+    PodcastState,
+    StatusResponse,
+    apply_update,
+    new_state,
+)
+from ...services.audio import synthesize_podcast_audio
+from ...services.ingestion import ingest_source
+from ...storage.repository import get_repository
 
 router = APIRouter()
 
 
-@router.post("/generate")
-async def generate_podcast() -> None:
+async def _run_podcast_workflow(job_id: str) -> None:
+    """Background task to run the full podcast generation workflow."""
+    repo = get_repository()
+    graph = get_graph_runner()
+
+    try:
+        state = await repo.load_state(job_id)
+        if not state:
+            return
+
+        state.status = JobStatus.RUNNING
+        state.updated_at = datetime.utcnow()
+        await repo.save_state(state)
+
+        ingestion_result = await ingest_source(state.source_url)
+
+        state.source_title = ingestion_result.title
+        state.source_markdown = ingestion_result.markdown
+        state.progress_pct = 10
+        state.updated_at = datetime.utcnow()
+        await repo.save_state(state)
+
+        state = await graph.run(state)
+        state.updated_at = datetime.utcnow()
+        await repo.save_state(state)
+
+        if state.director_decision and state.director_decision.value == "APPROVE":
+            state.current_step = CurrentStep.AUDIO
+            state.progress_pct = 90
+            state.updated_at = datetime.utcnow()
+            await repo.save_state(state)
+
+            audio_result = await synthesize_podcast_audio(state.script or "", job_id)
+            state.duration_seconds = audio_result.duration_seconds
+            state.progress_pct = 100
+            state.current_step = CurrentStep.COMPLETED
+            state.status = JobStatus.COMPLETED
+            state.updated_at = datetime.utcnow()
+            await repo.save_state(state)
+
+    except Exception as e:
+        state = await repo.load_state(job_id)
+        if state:
+            state.status = JobStatus.FAILED
+            state.error_message = str(e)
+            state.updated_at = datetime.utcnow()
+            await repo.save_state(state)
+
+
+@router.post("/generate", response_model=GenerateResponse)
+async def generate_podcast(
+    request: GenerateRequest,
+    background_tasks: BackgroundTasks,
+) -> GenerateResponse:
     """
-    Trigger podcast generation workflow.
+    Start a new podcast generation job.
 
-    Skeleton implementation only. The full request/response schema and
-    integration with LangGraph and storage will be implemented in the
-    `api-integration` task.
+    Creates a new job, initializes state, and starts the workflow in the background.
     """
-    raise HTTPException(status_code=501, detail="Not implemented yet")
+    job_id = str(uuid.uuid4())
+
+    state = new_state(job_id, request.source_url)
+
+    repo = get_repository()
+    await repo.save_state(state)
+
+    background_tasks.add_task(_run_podcast_workflow, job_id)
+
+    return GenerateResponse(
+        job_id=job_id,
+        status=state.status,
+        current_step=state.current_step,
+    )
 
 
-@router.get("/status/{job_id}")
+@router.get("/status/{job_id}", response_model=StatusResponse)
 async def get_podcast_status(
     job_id: str = Path(..., description="Podcast generation job identifier."),
-) -> None:
+) -> StatusResponse:
     """
-    Retrieve the latest `PodcastState` for a given job.
+    Get the current status of a podcast generation job.
 
-    Skeleton implementation only.
+    Returns status, progress, and final URL if completed.
     """
-    raise HTTPException(status_code=501, detail=f"Status for job {job_id!r} not implemented yet")
+    repo = get_repository()
+    state = await repo.load_state(job_id)
+
+    if not state:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    return StatusResponse(
+        job_id=state.id,
+        status=state.status,
+        current_step=state.current_step,
+        progress_pct=state.progress_pct,
+        script_version=state.script_version,
+        source_title=state.source_title,
+        final_podcast_url=state.final_podcast_url,
+        error_message=state.error_message,
+    )
 
 
-@router.get("/download/{job_id}")
+@router.get("/download/{job_id}", response_model=DownloadResponse)
 async def download_podcast(
     job_id: str = Path(..., description="Podcast generation job identifier."),
-) -> None:
+) -> DownloadResponse:
     """
-    Provide a download URL for the final synthesized podcast audio.
+    Get download URL for the final podcast.
 
-    Skeleton implementation only.
+    Returns 409 if the job is not yet completed.
     """
-    raise HTTPException(status_code=501, detail=f"Download for job {job_id!r} not implemented yet")
+    repo = get_repository()
+    state = await repo.load_state(job_id)
+
+    if not state:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    if state.status != JobStatus.COMPLETED:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job {job_id} is not completed. Current status: {state.status}",
+        )
+
+    if not state.final_podcast_url:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job {job_id} does not have a final audio URL yet",
+        )
+
+    return DownloadResponse(
+        final_podcast_url=state.final_podcast_url,
+        duration_seconds=state.duration_seconds,
+    )
 
 
-@router.patch("/edit")
-async def edit_podcast() -> None:
+@router.patch("/edit", response_model=EditResponse)
+async def edit_podcast(
+    request: EditRequest,
+    background_tasks: BackgroundTasks,
+) -> EditResponse:
     """
-    Apply human-in-the-loop edits to the generated script.
+    Edit the script of a podcast job.
 
-    Skeleton implementation only.
+    Optionally resume from the director node if resume_from_director is true.
     """
-    raise HTTPException(status_code=501, detail="Edit endpoint not implemented yet")
+    repo = get_repository()
+    state = await repo.load_state(request.job_id)
 
+    if not state:
+        raise HTTPException(status_code=404, detail=f"Job {request.job_id} not found")
+
+    state.script = request.script
+    state.script_version += 1
+    state.updated_at = datetime.utcnow()
+    await repo.save_state(state)
+
+    if request.resume_from_director:
+        state.status = JobStatus.RUNNING
+        state.director_decision = None
+        state.updated_at = datetime.utcnow()
+        await repo.save_state(state)
+
+        background_tasks.add_task(_resume_from_director, request.job_id)
+
+    return EditResponse(
+        job_id=state.id,
+        script_version=state.script_version,
+        status=state.status,
+    )
+
+
+async def _resume_from_director(job_id: str) -> None:
+    """Resume workflow from the director node."""
+    repo = get_repository()
+    graph = get_graph_runner()
+
+    try:
+        state = await repo.load_state(job_id)
+        if not state:
+            return
+
+        state = await graph.run(state)
+        state.updated_at = datetime.utcnow()
+        await repo.save_state(state)
+
+        if state.director_decision and state.director_decision.value == "APPROVE":
+            state.current_step = CurrentStep.AUDIO
+            state.progress_pct = 90
+            state.updated_at = datetime.utcnow()
+            await repo.save_state(state)
+
+            audio_result = await synthesize_podcast_audio(state.script or "", job_id)
+            state.duration_seconds = audio_result.duration_seconds
+            state.progress_pct = 100
+            state.current_step = CurrentStep.COMPLETED
+            state.status = JobStatus.COMPLETED
+            state.updated_at = datetime.utcnow()
+            await repo.save_state(state)
+
+    except Exception as e:
+        state = await repo.load_state(job_id)
+        if state:
+            state.status = JobStatus.FAILED
+            state.error_message = str(e)
+            state.updated_at = datetime.utcnow()
+            await repo.save_state(state)
+
+
+@router.get("/{job_id}/script")
+async def get_script(
+    job_id: str = Path(..., description="Podcast generation job identifier."),
+) -> dict:
+    """Get the current script for a job."""
+    repo = get_repository()
+    state = await repo.load_state(job_id)
+
+    if not state:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    return {
+        "job_id": state.id,
+        "script": state.script,
+        "script_version": state.script_version,
+        "source_title": state.source_title,
+    }
