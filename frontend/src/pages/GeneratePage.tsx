@@ -41,11 +41,6 @@ function Header() {
         >
           Library
         </Link>
-        <div className="flex items-center gap-2">
-          <div className="w-2 h-2 rounded-full bg-muted/30" />
-          <div className="w-2 h-2 rounded-full bg-muted/30" />
-          <div className="w-2 h-2 rounded-full bg-muted/30" />
-        </div>
       </nav>
     </motion.header>
   );
@@ -203,6 +198,7 @@ export function GeneratePage() {
                           sourceTitle={status.source_title}
                           onEdit={canEdit ? handleEdit : undefined}
                           canEdit={canEdit}
+                          shouldTruncate={isComplete}
                         />
                       ) : (
                         <motion.div
