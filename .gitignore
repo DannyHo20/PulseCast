@@ -9,3 +9,8 @@ __pycache__/
 venv/
 ENV/
 env/
+
+# Test artifacts
+test.wav
+test_*.wav
+*.test.log
